@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+# cast-routines — standalone CLI for managing scheduled CAST routines
+#
+# Usage: cast-routines <subcommand> [args]
+#
+# Subcommands:
+#   list                                          List all installed routines
+#   status [name]                                 Show detailed status (all or one)
+#   get <name>                                    Get a single routine record (JSON)
+#   install <yaml-path>                           Install routine from YAML spec
+#   uninstall <name>                              Remove cron entry and disable routine
+#   trigger <name> [--dry-run] [--arg k=v ...]    Trigger a routine manually
+#   enable <name>                                 Enable routine (reinstalls cron)
+#   disable <name>                                Disable routine (removes cron)
+#   validate <yaml-path>                          Validate a routine YAML spec
+#   version                                       Print version and exit
+#
+# Env:
+#   CAST_DB_PATH         path to cast.db (default ~/.claude/cast.db)
+#   CAST_ROUTINES_DIR    directory of routine YAMLs (default ~/.claude/routines)
+#   CAST_SCRIPTS_DIR     directory of helper scripts (default ~/.claude/scripts)
+#   CAST_AGENTS_DIR      optional — agents/core/ dir used by `validate` to verify
+#                        agent existence. If unset/missing, agent check is skipped.
+#   CAST_CRONTAB_CMD     crontab binary (default: crontab); useful in tests
+#
+# Requires: bash, python3, python3-yaml (PyYAML), sqlite3, crontab.
+
+set -euo pipefail
+
+if [[ "${CLAUDE_SUBPROCESS:-}" == "1" ]]; then
+  exit 0
+fi
+
+# ── Resolve install prefix ───────────────────────────────────────────────────
+# When installed via Homebrew, this script lives at <prefix>/bin/cast-routines
+# and helper scripts at <prefix>/scripts/. When run from a git checkout, helpers
+# live at ../scripts/ relative to this file.
+SCRIPT_REAL="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_REAL")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CAST_SCRIPTS_DIR="${CAST_SCRIPTS_DIR:-$HOME/.claude/scripts}"
+CAST_ROUTINES_DIR="${CAST_ROUTINES_DIR:-$HOME/.claude/routines}"
+CAST_DB_PATH="${CAST_DB_PATH:-$HOME/.claude/cast.db}"
+CRONTAB_CMD="${CAST_CRONTAB_CMD:-crontab}"
+
+# Helper scripts — prefer installed location, fall back to repo checkout
+_find_helper() {
+  local name="$1"
+  if [ -f "$CAST_SCRIPTS_DIR/$name" ]; then
+    echo "$CAST_SCRIPTS_DIR/$name"
+  elif [ -f "$REPO_DIR/scripts/$name" ]; then
+    echo "$REPO_DIR/scripts/$name"
+  else
+    echo ""
+  fi
+}
+
+ROUTINES_SCRIPT="$(_find_helper cast-db-routines.py)"
+ROUTINE_RUNNER="$(_find_helper cast-routine-runner.sh)"
+
+# ── Output helpers ───────────────────────────────────────────────────────────
+if [ -t 1 ] && [ "${TERM:-}" != "dumb" ]; then
+  C_BOLD='\033[1m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'
+  C_RED='\033[0;31m'; C_RESET='\033[0m'
+else
+  C_BOLD='' C_GREEN='' C_YELLOW='' C_RED='' C_RESET=''
+fi
+
+_err()  { printf "${C_RED}error:${C_RESET} %s\n" "$*" >&2; }
+_warn() { printf "${C_YELLOW}warn:${C_RESET}  %s\n" "$*" >&2; }
+
+# ── Version ──────────────────────────────────────────────────────────────────
+VERSION_FILE="$REPO_DIR/VERSION"
+[ -f "$VERSION_FILE" ] || VERSION_FILE="$(_find_helper VERSION)"
+CT_VERSION="$(cat "$VERSION_FILE" 2>/dev/null || echo unknown)"
+
+# ── Routine-name validation (prevent path traversal) ─────────────────────────
+_validate_name() {
+  local name="$1"
+  if ! [[ "$name" =~ ^[a-z][a-z0-9_-]{0,63}$ ]]; then
+    _err "Invalid routine name: '$name'. Must match ^[a-z][a-z0-9_-]{0,63}\$ (start with lowercase letter, max 64 chars)."
+    return 1
+  fi
+}
+
+_require_helper() {
+  local path="$1" name="$2"
+  if [ -z "$path" ] || [ ! -f "$path" ]; then
+    _err "$name not found. Run: bash install.sh (or brew install cast-routines)"
+    exit 1
+  fi
+}
+
+# ── Subcommand: list / status / get / passthrough ────────────────────────────
+_cmd_passthrough() {
+  local sub="$1"; shift
+  _require_helper "$ROUTINES_SCRIPT" "cast-db-routines.py"
+  CAST_DB_PATH="$CAST_DB_PATH" exec python3 "$ROUTINES_SCRIPT" "$sub" "$@"
+}
+
+# ── Subcommand: trigger ──────────────────────────────────────────────────────
+_cmd_trigger() {
+  local name="${1:-}"
+  [ -n "$name" ] || { _err "Usage: cast-routines trigger <name> [--dry-run] [--arg key=value ...]"; exit 1; }
+  shift
+  _validate_name "$name"
+  _require_helper "$ROUTINE_RUNNER" "cast-routine-runner.sh"
+  CAST_ROUTINES_DIR="$CAST_ROUTINES_DIR" \
+    CAST_DB_PATH="$CAST_DB_PATH" \
+    CAST_SCRIPTS_DIR="$CAST_SCRIPTS_DIR" \
+    exec bash "$ROUTINE_RUNNER" "$name" "$@"
+}
+
+# ── Subcommand: install ──────────────────────────────────────────────────────
+_cmd_install() {
+  local yaml_path="${1:-}"
+  [ -n "$yaml_path" ] || { _err "Usage: cast-routines install <yaml-path>"; exit 1; }
+  [ -f "$yaml_path" ] || { _err "YAML file not found: $yaml_path"; exit 1; }
+  _require_helper "$ROUTINES_SCRIPT" "cast-db-routines.py"
+  _require_helper "$ROUTINE_RUNNER" "cast-routine-runner.sh"
+
+  local name trigger_type trigger_value agent prompt_template output_dir enabled
+  name="$(python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); print(d.get('name',''))" "$yaml_path")"
+  [ -n "$name" ] || { _err "YAML missing required field: name"; exit 1; }
+  _validate_name "$name"
+
+  trigger_type="$(python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); print(d.get('trigger',{}).get('type','manual'))" "$yaml_path")"
+  trigger_value="$(python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); print(d.get('trigger',{}).get('value','') or '')" "$yaml_path")"
+  agent="$(python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); print(d.get('agent',''))" "$yaml_path")"
+  prompt_template="$(python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); print(d.get('prompt_template',''))" "$yaml_path")"
+  output_dir="$(python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); print(d.get('output_dir',''))" "$yaml_path")"
+  enabled="$(python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); print(1 if d.get('enabled',True) else 0)" "$yaml_path")"
+
+  mkdir -p "$CAST_ROUTINES_DIR"
+  cp "$yaml_path" "$CAST_ROUTINES_DIR/$name.yaml"
+
+  local upsert_json
+  upsert_json="$(python3 -c "
+import json, sys
+print(json.dumps({
+  'name': sys.argv[1],
+  'trigger_type': sys.argv[2],
+  'trigger_value': sys.argv[3] or None,
+  'agent_to_dispatch': sys.argv[4],
+  'prompt_template': sys.argv[5],
+  'output_dir': sys.argv[6],
+  'enabled': int(sys.argv[7]),
+}))" "$name" "$trigger_type" "$trigger_value" "$agent" "$prompt_template" "$output_dir" "$enabled")"
+
+  echo "$upsert_json" | CAST_DB_PATH="$CAST_DB_PATH" python3 "$ROUTINES_SCRIPT" upsert
+
+  if [ "$trigger_type" = "cron" ] && [ -n "$trigger_value" ]; then
+    if ! [[ "$trigger_value" =~ ^[0-9*,/-]+[[:space:]]+[0-9*,/-]+[[:space:]]+[0-9*,/-]+[[:space:]]+[0-9*,/-]+[[:space:]]+[0-9*,/-]+$ ]]; then
+      _err "Invalid cron expression: '$trigger_value'. Must be 5 fields of [0-9*,/-]+ separated by whitespace."
+      return 1
+    fi
+    local cron_entry="$trigger_value bash $ROUTINE_RUNNER $name --from-cron"
+    ( "$CRONTAB_CMD" -l 2>/dev/null; echo "$cron_entry" ) | sort -u | "$CRONTAB_CMD" -
+    echo "Installed cron entry: $cron_entry"
+  fi
+  echo "Installed routine: $name"
+}
+
+# ── Subcommand: uninstall ────────────────────────────────────────────────────
+_cmd_uninstall() {
+  local name="${1:-}"
+  [ -n "$name" ] || { _err "Usage: cast-routines uninstall <name>"; exit 1; }
+  _validate_name "$name"
+  _require_helper "$ROUTINES_SCRIPT" "cast-db-routines.py"
+  "$CRONTAB_CMD" -l 2>/dev/null | grep -vF "cast-routine-runner.sh $name --from-cron" | "$CRONTAB_CMD" - 2>/dev/null || true
+  CAST_DB_PATH="$CAST_DB_PATH" python3 "$ROUTINES_SCRIPT" enable-disable "$name" "0" 2>/dev/null || true
+  echo "Uninstalled routine: $name (YAML preserved at $CAST_ROUTINES_DIR/$name.yaml; re-run install to re-enable)"
+}
+
+# ── Subcommand: enable / disable ─────────────────────────────────────────────
+_cmd_enable() {
+  local name="${1:-}"
+  [ -n "$name" ] || { _err "Usage: cast-routines enable <name>"; exit 1; }
+  _validate_name "$name"
+  _require_helper "$ROUTINES_SCRIPT" "cast-db-routines.py"
+  CAST_DB_PATH="$CAST_DB_PATH" python3 "$ROUTINES_SCRIPT" enable-disable "$name" "1"
+  local yaml_file="$CAST_ROUTINES_DIR/$name.yaml"
+  if [ -f "$yaml_file" ]; then
+    local trigger_type trigger_value
+    trigger_type="$(python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); print(d.get('trigger',{}).get('type','manual'))" "$yaml_file")"
+    trigger_value="$(python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); print(d.get('trigger',{}).get('value','') or '')" "$yaml_file")"
+    if [ "$trigger_type" = "cron" ] && [ -n "$trigger_value" ]; then
+      local cron_entry="$trigger_value bash $ROUTINE_RUNNER $name --from-cron"
+      ( "$CRONTAB_CMD" -l 2>/dev/null; echo "$cron_entry" ) | sort -u | "$CRONTAB_CMD" -
+      echo "Reinstalled cron entry for: $name"
+    fi
+  fi
+  echo "Enabled routine: $name"
+}
+
+_cmd_disable() {
+  local name="${1:-}"
+  [ -n "$name" ] || { _err "Usage: cast-routines disable <name>"; exit 1; }
+  _validate_name "$name"
+  _require_helper "$ROUTINES_SCRIPT" "cast-db-routines.py"
+  CAST_DB_PATH="$CAST_DB_PATH" python3 "$ROUTINES_SCRIPT" enable-disable "$name" "0"
+  "$CRONTAB_CMD" -l 2>/dev/null | grep -vF "cast-routine-runner.sh $name --from-cron" | "$CRONTAB_CMD" - 2>/dev/null || true
+  echo "Disabled routine: $name"
+}
+
+# ── Subcommand: validate ─────────────────────────────────────────────────────
+_cmd_validate() {
+  local yaml_path="${1:-}"
+  [ -n "$yaml_path" ] || { _err "Usage: cast-routines validate <yaml-path>"; exit 1; }
+  [ -f "$yaml_path" ] || { _err "YAML file not found: $yaml_path"; exit 1; }
+  local agents_dir="${CAST_AGENTS_DIR:-}"
+  CAST_AGENTS_DIR="$agents_dir" python3 - "$yaml_path" <<'PYEOF'
+import yaml, sys, os
+yaml_path = sys.argv[1]
+agents_dir = os.environ.get("CAST_AGENTS_DIR", "")
+errors = []
+try:
+    with open(yaml_path) as f:
+        data = yaml.safe_load(f)
+except yaml.YAMLError as e:
+    print(f"ERROR: invalid YAML: {e}")
+    sys.exit(1)
+
+for field in ["name", "agent", "prompt_template", "output_dir"]:
+    if not data.get(field):
+        errors.append(f"missing required field: {field}")
+
+trigger = data.get("trigger", {})
+if not isinstance(trigger, dict):
+    errors.append("'trigger' must be a mapping")
+else:
+    if not trigger.get("type"):
+        errors.append("missing required field: trigger.type")
+    if not trigger.get("value") and trigger.get("type") == "cron":
+        errors.append("missing required field: trigger.value (required when trigger.type=cron)")
+
+# Optional agent-existence check — only if CAST_AGENTS_DIR is configured
+agent = data.get("agent", "")
+if agent and agents_dir and os.path.isdir(agents_dir):
+    agent_file = os.path.join(agents_dir, f"{agent}.md")
+    if not os.path.isfile(agent_file):
+        errors.append(f"agent not found in {agents_dir}: {agent}")
+
+if errors:
+    for e in errors:
+        print(f"ERROR: {e}")
+    sys.exit(1)
+print(f"OK: {data.get('name')} (agent: {agent})")
+PYEOF
+}
+
+# ── Usage / version ──────────────────────────────────────────────────────────
+_cmd_version() { echo "cast-routines v$CT_VERSION"; }
+
+_cmd_usage() {
+  cat <<EOF
+cast-routines v$CT_VERSION — scheduled CAST agent routines
+
+Usage: cast-routines <subcommand> [args]
+
+Subcommands:
+  list                                          List all installed routines
+  status [name]                                 Show detailed status (all or one)
+  get <name>                                    Get a single routine record (JSON)
+  install <yaml-path>                           Install routine from YAML spec
+  uninstall <name>                              Remove cron + disable routine
+  trigger <name> [--dry-run] [--arg k=v ...]    Trigger a routine manually
+  enable <name>                                 Enable routine (reinstalls cron)
+  disable <name>                                Disable routine (removes cron)
+  validate <yaml-path>                          Validate a routine YAML spec
+  version                                       Print version and exit
+  help                                          Show this message
+
+Environment:
+  CAST_DB_PATH         $CAST_DB_PATH
+  CAST_ROUTINES_DIR    $CAST_ROUTINES_DIR
+  CAST_SCRIPTS_DIR     $CAST_SCRIPTS_DIR
+  CAST_AGENTS_DIR      (unset — agent-existence check skipped on validate)
+  CAST_CRONTAB_CMD     $CRONTAB_CMD
+
+See:  https://github.com/ek33450505/cast-routines
+EOF
+}
+
+# ── Dispatch ─────────────────────────────────────────────────────────────────
+SUB="${1:-help}"
+shift 2>/dev/null || true
+
+case "$SUB" in
+  list|status|get)         _cmd_passthrough "$SUB" "$@" ;;
+  trigger)                 _cmd_trigger "$@" ;;
+  install)                 _cmd_install "$@" ;;
+  uninstall)               _cmd_uninstall "$@" ;;
+  enable)                  _cmd_enable "$@" ;;
+  disable)                 _cmd_disable "$@" ;;
+  validate)                _cmd_validate "$@" ;;
+  version|-v|--version)    _cmd_version ;;
+  help|-h|--help|"")       _cmd_usage ;;
+  *)                       _cmd_passthrough "$SUB" "$@" ;;
+esac

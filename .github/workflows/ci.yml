@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          ignore_paths: tests/test_helper
+
+  syntax:
+    name: bash -n syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          set -e
+          for f in bin/cast-routines install.sh uninstall.sh scripts/*.sh; do
+            echo "  syntax: $f"
+            bash -n "$f"
+          done
+
+  bats:
+    name: bats / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install BATS
+        run: |
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            brew install bats-core
+          else
+            sudo apt-get update && sudo apt-get install -y bats
+          fi
+      - name: Install PyYAML
+        run: pip3 install pyyaml
+      - name: Run BATS
+        run: bats tests/
+
+  install-dry-run:
+    name: install.sh round-trip
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PyYAML
+        run: pip3 install pyyaml
+      - name: install + uninstall round-trip
+        run: |
+          set -e
+          bash install.sh
+          test -x "$HOME/.local/bin/cast-routines"
+          test -f "$HOME/.claude/scripts/cast-routine-runner.sh"
+          test -d "$HOME/.claude/routines"
+          ls "$HOME/.claude/routines" | head
+          bash uninstall.sh
+          test ! -f "$HOME/.local/bin/cast-routines"
+          test ! -f "$HOME/.claude/scripts/cast-routine-runner.sh"
