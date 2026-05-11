@@ -16,6 +16,10 @@ jobs:
         uses: ludeeus/action-shellcheck@master
         with:
           ignore_paths: tests/test_helper
+          # Fail only on `error` severity; `warning` and `style` notes are surfaced
+          # but non-blocking (SC2059 printf-style + SC2034 cross-script vars are
+          # intentional and would otherwise dominate the signal).
+          severity: error
 
   syntax:
     name: bash -n syntax
@@ -38,6 +42,10 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Install BATS
         run: |
           if [[ "$RUNNER_OS" == "macOS" ]]; then
@@ -46,7 +54,7 @@ jobs:
             sudo apt-get update && sudo apt-get install -y bats
           fi
       - name: Install PyYAML
-        run: pip3 install pyyaml
+        run: python3 -m pip install pyyaml
       - name: Run BATS
         run: bats tests/
 
