@@ -62,8 +62,8 @@ notes: |
 
   Usage:
     cast routines trigger release-celebration \
-      --arg repo=ek33450505/claude-agent-team \
-      --arg version=v7.0.0
+      --arg repo=<owner>/<repo> \
+      --arg version=<tag>
 
   Both output files are DRAFTS. Review linkedin-post.md and devto-outline.md
   before publishing. The prompt explicitly verifies stats via 'gh' and the test

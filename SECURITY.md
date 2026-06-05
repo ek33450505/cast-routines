@@ -15,7 +15,7 @@ Report privately using [GitHub Security Advisories](https://github.com/ek3345050
 
 ### What to Include
 
-- **Version** — output of `cat ~/Projects/personal/cast-routines/VERSION`
+- **Version** — output of `cast-routines --version` or `cat "$(brew --prefix cast-routines)/VERSION"` (or `cat VERSION` from the repo root)
 - **Operating system** — macOS version (`sw_vers`) or Linux distro
 - **Which file** — e.g., `install.sh`, `bin/cast-routines`, `scripts/cast-routine-runner.sh`
 - **Steps to reproduce** — minimal, clear reproduction steps
