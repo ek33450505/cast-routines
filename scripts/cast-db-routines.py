@@ -17,7 +17,6 @@ import json
 import sqlite3
 import logging
 from datetime import datetime, timezone
-from pathlib import Path
 
 # cast_db is co-located in scripts/ — import guardedly for hook failure logging.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -72,7 +71,7 @@ DB_PATH = os.environ.get("CAST_DB_PATH", os.path.expanduser("~/.claude/cast.db")
 
 def _connect() -> sqlite3.Connection:
     """Return a sqlite3 connection with row_factory set."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5)
     conn.row_factory = sqlite3.Row
     return conn
 
