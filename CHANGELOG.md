@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2] — 2026-06-15
+
+### Changed
+
+- **Concurrency hardening** (`scripts/cast-db-routines.py`): added `timeout=5` to `sqlite3.connect()` to prevent indefinite hangs when multiple processes contend on the routines DB.
+- **Cleanup**: removed unused `from pathlib import Path` import.
+
 ## [v0.1.1] — 2026-06-05
 
 ### Fixed
