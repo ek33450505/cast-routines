@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.3] — 2026-07-01
+
+### Changed
+- v9 ecosystem sync: version bump for the CAST v9 ecosystem consolidation (repo is already v9-clean; no behavior change).
+
+### Fixed
+- `.gitignore`: ignore `__pycache__/` and `*.pyc` so Python bytecode no longer shows as untracked clutter.
+
 ## [0.1.2] — 2026-06-15
 
 ### Changed
